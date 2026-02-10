@@ -4,7 +4,8 @@ Automated daily backup script for databases and sites to S3.
 
 ## What it does
 
-- Dumps all MySQL databases (excluding system databases) and uploads them gzipped to S3
+- Dumps all MySQL databases (excluding system databases) and uploads them gzipped to S3 (if MySQL is installed)
+- Dumps all PostgreSQL databases (excluding `postgres`) and uploads them gzipped to S3 (if PostgreSQL is installed)
 - Archives site files (`/var/www/*/`) including `.env`, `certs`, `conf`, and `persistent` directories and uploads them gzipped to S3
 - Backups rotate on a 31-day cycle based on day of month
 - Uploads are rate-limited to 1 MB/s via `pv`
@@ -18,7 +19,8 @@ s3://rocketeers/backups/{server}/{name}/files/{day}.tar.gz
 
 ## Requirements
 
-- `mysql` / `mysqldump`
+- `mysql` / `mysqldump` (optional)
+- `psql` / `pg_dump` (optional)
 - `s3cmd` (at `/usr/local/bin/s3cmd`)
 - `pv`
 - `gzip`
@@ -32,6 +34,7 @@ The following placeholders in `backup.sh` must be replaced before deployment:
 | `%MYSQL_USER%` | MySQL username |
 | `%MYSQL_PASSWORD%` | MySQL password |
 | `%SERVER%` | Server identifier for S3 |
+| `%POSTGRES_USER%` | PostgreSQL username |
 
 ## Usage
 
