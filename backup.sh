@@ -5,6 +5,20 @@ set -uo pipefail
 DAY=`date +"%d"`
 S3CMD="/usr/local/bin/s3cmd"
 
+# check required dependencies
+
+MISSING=()
+
+command -v gzip &> /dev/null || MISSING+=("gzip")
+command -v pv &> /dev/null || MISSING+=("pv")
+command -v tar &> /dev/null || MISSING+=("tar")
+[[ -x "$S3CMD" ]] || MISSING+=("s3cmd ($S3CMD)")
+
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+  echo "ERROR: Missing required dependencies: ${MISSING[*]}" >&2
+  exit 1
+fi
+
 # mysql databases
 
 if command -v mysql &> /dev/null; then
