@@ -4,9 +4,17 @@ set -uo pipefail
 
 DAY=$(date +"%d")
 S3CMD="/usr/local/bin/s3cmd"
+BACKUP_START=$(date +%s)
 
 # configurable rate limit (default: 1 MB/s), set to 0 to disable
 RATE_LIMIT="${BACKUP_RATE_LIMIT:-1m}"
+
+# discord webhook for notifications (leave empty to disable)
+DISCORD_WEBHOOK_URL="%DISCORD_WEBHOOK_URL%"
+
+# collect errors in a temp file so subshells (piped while-read loops) can append to it
+ERRORS_FILE=$(mktemp)
+trap "rm -f $ERRORS_FILE" EXIT
 
 # run backups at lowest CPU and I/O priority so production traffic is unaffected
 NICE="nice -n 19"
@@ -95,10 +103,13 @@ if command -v mysql &> /dev/null; then
 
       if [[ ${PIPE_STATUS[0]} -ne 0 ]]; then
         echo "ERROR: mysqldump failed for database: $DATABASE" >&2
+        echo "mysqldump failed for MySQL database: $DATABASE" >> "$ERRORS_FILE"
       elif [[ ${PIPE_STATUS[1]} -ne 0 ]]; then
         echo "ERROR: Compression failed for database: $DATABASE" >&2
+        echo "Compression failed for MySQL database: $DATABASE" >> "$ERRORS_FILE"
       elif [[ ${PIPE_STATUS[3]} -ne 0 ]]; then
         echo "ERROR: S3 upload failed for database: $DATABASE" >&2
+        echo "S3 upload failed for MySQL database: $DATABASE" >> "$ERRORS_FILE"
       else
         echo "Successfully backed up MySQL database: $DATABASE (${ELAPSED}s)"
       fi
@@ -132,10 +143,13 @@ if command -v psql &> /dev/null; then
 
       if [[ ${PIPE_STATUS[0]} -ne 0 ]]; then
         echo "ERROR: pg_dump failed for database: $DATABASE" >&2
+        echo "pg_dump failed for PostgreSQL database: $DATABASE" >> "$ERRORS_FILE"
       elif [[ ${PIPE_STATUS[1]} -ne 0 ]]; then
         echo "ERROR: Compression failed for database: $DATABASE" >&2
+        echo "Compression failed for PostgreSQL database: $DATABASE" >> "$ERRORS_FILE"
       elif [[ ${PIPE_STATUS[3]} -ne 0 ]]; then
         echo "ERROR: S3 upload failed for database: $DATABASE" >&2
+        echo "S3 upload failed for PostgreSQL database: $DATABASE" >> "$ERRORS_FILE"
       else
         echo "Successfully backed up PostgreSQL database: $DATABASE (${ELAPSED}s)"
       fi
@@ -172,12 +186,85 @@ for DIR in /var/www/*; do
 
   if [[ ${PIPE_STATUS[0]} -ne 0 ]]; then
     echo "ERROR: tar failed for site: $SITE" >&2
+    echo "tar failed for site: $SITE" >> "$ERRORS_FILE"
   elif [[ ${PIPE_STATUS[1]} -ne 0 ]]; then
     echo "ERROR: Compression failed for site: $SITE" >&2
+    echo "Compression failed for site: $SITE" >> "$ERRORS_FILE"
   elif [[ ${PIPE_STATUS[3]} -ne 0 ]]; then
     echo "ERROR: S3 upload failed for site: $SITE" >&2
+    echo "S3 upload failed for site: $SITE" >> "$ERRORS_FILE"
   else
     echo "Successfully backed up site: $SITE (${ELAPSED}s)"
   fi
 
 done
+
+# discord notifications
+
+notify_discord() {
+  local color="$1"
+  local title="$2"
+  local description="$3"
+
+  local payload
+  payload=$(cat <<PAYLOAD
+{
+  "embeds": [{
+    "title": "$title",
+    "description": "$description",
+    "color": $color,
+    "footer": { "text": "%SERVER%" },
+    "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  }]
+}
+PAYLOAD
+  )
+
+  curl -sf -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL" > /dev/null
+}
+
+if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+
+  BACKUP_DURATION=$(( $(date +%s) - BACKUP_START ))
+  DURATION_HOURS=$(( BACKUP_DURATION / 3600 ))
+  DURATION_MINUTES=$(( (BACKUP_DURATION % 3600) / 60 ))
+  DURATION_DISPLAY="${DURATION_HOURS}h ${DURATION_MINUTES}m"
+  AMSTERDAM_TIME=$(TZ="Europe/Amsterdam" date +"%H:%M")
+  AMSTERDAM_HOUR=$(TZ="Europe/Amsterdam" date +"%H")
+
+  REASONS=()
+
+  # backup took more than 5 hours
+  if [[ $BACKUP_DURATION -ge 18000 ]]; then
+    REASONS+=("Backup took **${DURATION_DISPLAY}** (threshold: 5h)")
+  fi
+
+  # completed after 05:00 Europe/Amsterdam
+  if [[ $AMSTERDAM_HOUR -ge 5 ]] && [[ $AMSTERDAM_HOUR -lt 12 ]]; then
+    REASONS+=("Completed at **${AMSTERDAM_TIME}** Amsterdam time (after 05:00)")
+  fi
+
+  # errors occurred
+  if [[ -s "$ERRORS_FILE" ]]; then
+    ERROR_LIST=""
+    while IFS= read -r line; do
+      ERROR_LIST="${ERROR_LIST}• ${line}\\n"
+    done < "$ERRORS_FILE"
+    REASONS+=("**Errors:**\\n${ERROR_LIST}")
+  fi
+
+  if [[ ${#REASONS[@]} -gt 0 ]]; then
+    DESCRIPTION=""
+    for reason in "${REASONS[@]}"; do
+      DESCRIPTION="${DESCRIPTION}${reason}\\n\\n"
+    done
+    DESCRIPTION="${DESCRIPTION}Total duration: ${DURATION_DISPLAY}"
+
+    if [[ -s "$ERRORS_FILE" ]]; then
+      notify_discord 16711680 "Backup completed with errors" "$DESCRIPTION"
+    else
+      notify_discord 16744448 "Backup completed (warning)" "$DESCRIPTION"
+    fi
+  fi
+
+fi

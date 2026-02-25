@@ -28,6 +28,16 @@ s3://rocketeers/backups/{server}/{name}/databases/{day}.sql.gz
 s3://rocketeers/backups/{server}/{name}/files/{day}.tar.gz
 ```
 
+## Discord notifications
+
+When configured, the script sends a Discord notification if any of these conditions are met:
+
+- **Errors** — any database dump, compression, or S3 upload failure (red embed)
+- **Slow backup** — total duration exceeds 5 hours (orange embed)
+- **Late completion** — backup finishes after 05:00 Europe/Amsterdam time (orange embed)
+
+Notifications include the server name, total duration, and a list of specific errors when applicable.
+
 ## Requirements
 
 - `mysql` / `mysqldump` (optional)
@@ -35,6 +45,7 @@ s3://rocketeers/backups/{server}/{name}/files/{day}.tar.gz
 - `s3cmd` (at `/usr/local/bin/s3cmd`)
 - `pv`
 - `gzip` or `pigz` (recommended)
+- `curl` (for Discord notifications)
 
 ## Configuration
 
@@ -46,6 +57,7 @@ The following placeholders in `backup.sh` must be replaced before deployment:
 | `%MYSQL_PASSWORD%` | MySQL password |
 | `%SERVER%` | Server identifier for S3 |
 | `%POSTGRES_USER%` | PostgreSQL username |
+| `%DISCORD_WEBHOOK_URL%` | Discord webhook URL for notifications (leave empty to disable) |
 
 ### Environment variables
 
@@ -65,6 +77,6 @@ The following placeholders in `backup.sh` must be replaced before deployment:
 
 ## TODO
 
-- [ ] Discord notifications on success/failure
+- [x] Discord notifications on success/failure
 - [ ] Slack notifications on success/failure
 - [ ] Telegram notifications on success/failure
