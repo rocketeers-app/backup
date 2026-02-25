@@ -2,14 +2,32 @@
 
 set -uo pipefail
 
-DAY=`date +"%d"`
+DAY=$(date +"%d")
 S3CMD="/usr/local/bin/s3cmd"
+
+# configurable rate limit (default: 1 MB/s), set to 0 to disable
+RATE_LIMIT="${BACKUP_RATE_LIMIT:-1m}"
+
+# run backups at lowest CPU and I/O priority so production traffic is unaffected
+NICE="nice -n 19"
+IONICE=""
+if command -v ionice &> /dev/null; then
+  IONICE="ionice -c3"
+fi
+
+# prefer pigz (parallel gzip) over gzip; use compression level 6 (default)
+# level 9 is 3-4x slower than level 6 with only ~2-5% smaller output
+if command -v pigz &> /dev/null; then
+  COMPRESS="pigz -6"
+else
+  COMPRESS="gzip -6"
+fi
 
 # check required dependencies
 
 MISSING=()
 
-command -v gzip &> /dev/null || MISSING+=("gzip")
+command -v $COMPRESS &> /dev/null || MISSING+=("gzip or pigz")
 command -v pv &> /dev/null || MISSING+=("pv")
 command -v tar &> /dev/null || MISSING+=("tar")
 [[ -x "$S3CMD" ]] || MISSING+=("s3cmd ($S3CMD)")
@@ -18,6 +36,33 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
   echo "ERROR: Missing required dependencies: ${MISSING[*]}" >&2
   exit 1
 fi
+
+# upload helper with retry logic (exponential backoff)
+upload_to_s3() {
+  local s3_path="$1"
+  local max_retries=3
+  local attempt=0
+  local wait_time=2
+
+  while read -r chunk; do
+    echo -n "$chunk"
+  done | while true; do
+    attempt=$((attempt + 1))
+
+    if pv -L "$RATE_LIMIT" -q | $S3CMD --acl-private put - "$s3_path"; then
+      return 0
+    fi
+
+    if [[ $attempt -ge $max_retries ]]; then
+      echo "ERROR: S3 upload failed after $max_retries attempts: $s3_path" >&2
+      return 1
+    fi
+
+    echo "WARN: S3 upload attempt $attempt failed, retrying in ${wait_time}s..." >&2
+    sleep $wait_time
+    wait_time=$((wait_time * 2))
+  done
+}
 
 # mysql databases
 
@@ -29,24 +74,33 @@ if command -v mysql &> /dev/null; then
     while read DATABASE; do
 
       echo "Backing up MySQL database: $DATABASE"
+      START=$(date +%s)
 
-      mysqldump --user=%MYSQL_USER% --password=%MYSQL_PASSWORD% \
+      $IONICE $NICE mysqldump --user=%MYSQL_USER% --password=%MYSQL_PASSWORD% \
         --add-drop-table \
         --extended-insert \
         --single-transaction \
+        --quick \
         --skip-comments \
         --routines \
         --events \
         --no-tablespaces \
         "$DATABASE" | \
-        gzip -9 | \
-        pv -L 1m -q | \
+        $IONICE $NICE $COMPRESS | \
+        pv -L "$RATE_LIMIT" -q | \
         $S3CMD --acl-private put - s3://rocketeers/backups/%SERVER%/$DATABASE/databases/$DAY.sql.gz
 
-      if [[ $? -ne 0 ]]; then
-        echo "ERROR: Failed to backup MySQL database: $DATABASE" >&2
+      PIPE_STATUS=("${PIPESTATUS[@]}")
+      ELAPSED=$(( $(date +%s) - START ))
+
+      if [[ ${PIPE_STATUS[0]} -ne 0 ]]; then
+        echo "ERROR: mysqldump failed for database: $DATABASE" >&2
+      elif [[ ${PIPE_STATUS[1]} -ne 0 ]]; then
+        echo "ERROR: Compression failed for database: $DATABASE" >&2
+      elif [[ ${PIPE_STATUS[3]} -ne 0 ]]; then
+        echo "ERROR: S3 upload failed for database: $DATABASE" >&2
       else
-        echo "Successfully backed up MySQL database: $DATABASE"
+        echo "Successfully backed up MySQL database: $DATABASE (${ELAPSED}s)"
       fi
 
     done
@@ -63,19 +117,27 @@ if command -v psql &> /dev/null; then
     while read DATABASE; do
 
       echo "Backing up PostgreSQL database: $DATABASE"
+      START=$(date +%s)
 
-      pg_dump --user=%POSTGRES_USER% \
+      $IONICE $NICE pg_dump --user=%POSTGRES_USER% \
         --no-owner \
         --no-acl \
         "$DATABASE" | \
-        gzip -9 | \
-        pv -L 1m -q | \
+        $IONICE $NICE $COMPRESS | \
+        pv -L "$RATE_LIMIT" -q | \
         $S3CMD --acl-private put - s3://rocketeers/backups/%SERVER%/$DATABASE/databases/$DAY.sql.gz
 
-      if [[ $? -ne 0 ]]; then
-        echo "ERROR: Failed to backup PostgreSQL database: $DATABASE" >&2
+      PIPE_STATUS=("${PIPESTATUS[@]}")
+      ELAPSED=$(( $(date +%s) - START ))
+
+      if [[ ${PIPE_STATUS[0]} -ne 0 ]]; then
+        echo "ERROR: pg_dump failed for database: $DATABASE" >&2
+      elif [[ ${PIPE_STATUS[1]} -ne 0 ]]; then
+        echo "ERROR: Compression failed for database: $DATABASE" >&2
+      elif [[ ${PIPE_STATUS[3]} -ne 0 ]]; then
+        echo "ERROR: S3 upload failed for database: $DATABASE" >&2
       else
-        echo "Successfully backed up PostgreSQL database: $DATABASE"
+        echo "Successfully backed up PostgreSQL database: $DATABASE (${ELAPSED}s)"
       fi
 
     done
@@ -92,22 +154,30 @@ for DIR in /var/www/*; do
   [[ $SITE = "default" ]] && continue
 
   echo "Backing up site: $SITE"
+  START=$(date +%s)
 
-  tar -cpf - \
+  $IONICE $NICE tar -cpf - \
     --ignore-failed-read \
     --exclude="$DIR/persistent/storage/app/public/cache" \
     "$DIR/.env" \
     "$DIR/certs" \
     "$DIR/conf" \
     "$DIR/persistent" | \
-    gzip -9 | \
-    pv -L 1m -q | \
+    $IONICE $NICE $COMPRESS | \
+    pv -L "$RATE_LIMIT" -q | \
     $S3CMD --acl-private put - s3://rocketeers/backups/%SERVER%/$SITE/files/$DAY.tar.gz
 
-  if [[ $? -ne 0 ]]; then
-    echo "ERROR: Failed to backup site: $SITE" >&2
+  PIPE_STATUS=("${PIPESTATUS[@]}")
+  ELAPSED=$(( $(date +%s) - START ))
+
+  if [[ ${PIPE_STATUS[0]} -ne 0 ]]; then
+    echo "ERROR: tar failed for site: $SITE" >&2
+  elif [[ ${PIPE_STATUS[1]} -ne 0 ]]; then
+    echo "ERROR: Compression failed for site: $SITE" >&2
+  elif [[ ${PIPE_STATUS[3]} -ne 0 ]]; then
+    echo "ERROR: S3 upload failed for site: $SITE" >&2
   else
-    echo "Successfully backed up site: $SITE"
+    echo "Successfully backed up site: $SITE (${ELAPSED}s)"
   fi
 
 done
