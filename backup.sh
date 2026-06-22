@@ -12,6 +12,7 @@ MISSING=()
 command -v gzip &> /dev/null || MISSING+=("gzip")
 command -v pv &> /dev/null || MISSING+=("pv")
 command -v tar &> /dev/null || MISSING+=("tar")
+
 [[ -x "$S3CMD" ]] || MISSING+=("s3cmd ($S3CMD)")
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
@@ -100,6 +101,7 @@ for DIR in /var/www/*; do
     "$DIR/certs" \
     "$DIR/conf" \
     "$DIR/persistent" | \
+    "$DIR/releases" | \
     gzip -9 | \
     pv -L 1m -q | \
     $S3CMD --acl-private put - s3://rocketeers/backups/%SERVER%/$SITE/files/$DAY.tar.gz
